@@ -315,6 +315,8 @@ typedef enum {
   TY_VLA, // variable-length array
   TY_STRUCT,
   TY_UNION,
+
+  TY_GENERALIZATION
 } TypeKind;
 
 struct Type {
@@ -350,6 +352,9 @@ struct Type {
   Member *members;
   bool is_flexible;
   bool is_packed;
+
+  // Allowed specializations of a generalization
+  Member *specializations;
 
   // Function type
   Type *return_ty;

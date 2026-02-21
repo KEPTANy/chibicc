@@ -2674,10 +2674,67 @@ static Type *struct_union_decl(Token **rest, Token *tok) {
   return ty;
 }
 
-// struct-decl = struct-union-decl
+// TODO: Consider parsing nameless specializations.
+// 
+// spec-list = (ident ("," ident)* ":" type-name ";")* ">"
+static Member *spec_list(Token **rest, Token *tok) {
+  Member *head = NULL;
+  int idx = 0;
+  while (!equal(tok, ">")) {
+    int cnt = 0; // number of identifiers corresponding to the same typename
+  
+    while (equal(tok, ",") || cnt == 0) {
+      if (cnt != 0) {
+        tok = skip(tok, ",");
+      }
+
+      if (tok->kind != TK_IDENT) {
+        error_tok(tok, "not a valid specialization name");
+      }
+
+      Member *mem = calloc(1, sizeof(Member));
+      mem->name = tok;
+      tok = tok->next;
+      mem->idx = idx++;
+      mem->next = head;
+      head = mem;
+
+      cnt++;
+    }
+
+    tok = skip(tok, ":");
+    Type *ty = typename(&tok, tok);
+    Member *ptr = head;
+    for (int i = 0; i < cnt; i++) {
+      ptr->ty = ty;
+      ptr = ptr->next;
+    }
+
+    tok = skip(tok, ";");
+  }
+
+  *rest = skip(tok, ">");
+  return head;
+}
+
+// Also handles generalization parsing.
+//
+// struct-decl = struct-union-decl ("<" spec-list)?
 static Type *struct_decl(Token **rest, Token *tok) {
-  Type *ty = struct_union_decl(rest, tok);
-  ty->kind = TY_STRUCT;
+  Type *ty = struct_union_decl(&tok, tok);
+
+  if (equal(tok, "<")) {
+    tok = skip(tok, "<");
+    ty->kind = TY_GENERALIZATION;
+    ty->size = -1; // incomplete type
+    ty->specializations = spec_list(&tok, tok);
+  }
+
+  if (ty->kind != TY_GENERALIZATION) {
+    ty->kind = TY_STRUCT;
+  }
+
+  *rest = tok;
 
   if (ty->size < 0)
     return ty;
