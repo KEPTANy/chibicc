@@ -3383,6 +3383,65 @@ static void scan_globals(void) {
   globals = head.next;
 }
 
+// Lookahead function to check for generalization extention. Two cases:
+//
+// struct ident +
+//          ^ generalization
+//
+// ident +
+//   ^ generalization
+static bool is_extension(Token *tok) {
+  Type *ty = NULL;
+  if (equal(tok, "struct")) {
+    tok = tok->next;
+    if (!tok) {
+      return false;
+    }
+    ty = find_tag(tok);
+  } else {
+    ty = find_typedef(tok);
+  }
+
+  tok = tok->next;
+  if (!tok) {
+    return false;
+  }
+
+  if (!ty || ty->kind != TY_GENERALIZATION) {
+    return false;
+  }
+
+  return equal(tok, "+");
+}
+
+// extension = ("struct")? ident "+" "<" spec-list ";"
+static Token *extension(Token *tok) {
+  Type *ty = NULL;
+  if (equal(tok, "struct")) {
+    tok = tok->next;
+    ty = find_tag(tok);
+  } else {
+    ty = find_typedef(tok);
+  }
+  
+  tok = skip(tok->next, "+");
+  tok = skip(tok, "<");
+
+  // ty is a shallow copy of a recorded type, just need to append new specs
+  Member *new_specs = spec_list(&tok, tok);
+  if (new_specs) {
+    Member *old = ty->specializations;
+    ty->specializations = new_specs;
+    while (new_specs->next) {
+      new_specs = new_specs->next;
+    }
+    new_specs->next = old;
+  }
+
+  tok = skip(tok, ";");
+  return tok;
+}
+
 static void declare_builtin_functions(void) {
   Type *ty = func_type(pointer_to(ty_void));
   ty->params = copy_type(ty_int);
@@ -3390,12 +3449,17 @@ static void declare_builtin_functions(void) {
   builtin_alloca->is_definition = false;
 }
 
-// program = (typedef | function-definition | global-variable)*
+// program = (typedef | function-definition | global-variable | extension)*
 Obj *parse(Token *tok) {
   declare_builtin_functions();
   globals = NULL;
 
   while (tok->kind != TK_EOF) {
+    if (is_extension(tok)) {
+      tok = extension(tok);
+      continue;
+    }
+
     VarAttr attr = {};
     Type *basety = declspec(&tok, tok, &attr);
 
