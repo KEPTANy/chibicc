@@ -316,7 +316,8 @@ typedef enum {
   TY_STRUCT,
   TY_UNION,
 
-  TY_GENERALIZATION
+  TY_GENERALIZATION,
+  TY_SPECIALIZATION
 } TypeKind;
 
 struct Type {

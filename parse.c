@@ -147,6 +147,7 @@ static Node *cast(Token **rest, Token *tok);
 static Member *get_struct_member(Type *ty, Token *tok);
 static Type *struct_decl(Token **rest, Token *tok);
 static Type *union_decl(Token **rest, Token *tok);
+static Type *resolve_specialization(Token **rest, Token *tok, Type *basety);
 static Node *postfix(Token **rest, Token *tok);
 static Node *funcall(Token **rest, Token *tok, Node *node);
 static Node *unary(Token **rest, Token *tok);
@@ -475,6 +476,15 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       } else {
         ty = ty2;
         tok = tok->next;
+      }
+
+      // specialization choice, for example:
+      // 
+      // struct A {} <a: char; b: int;>;
+      // A.b val;
+      //  ^ current token
+      if (ty->kind == TY_GENERALIZATION && equal(tok, ".")) {
+        ty = resolve_specialization(&tok, tok, ty);
       }
 
       counter += OTHER;
@@ -2717,31 +2727,10 @@ static Member *spec_list(Token **rest, Token *tok) {
   return head;
 }
 
-// Also handles generalization parsing.
-//
-// struct-decl = struct-union-decl ("<" spec-list)?
-static Type *struct_decl(Token **rest, Token *tok) {
-  Type *ty = struct_union_decl(&tok, tok);
-
-  if (equal(tok, "<")) {
-    tok = skip(tok, "<");
-    ty->kind = TY_GENERALIZATION;
-    ty->size = -1; // incomplete type
-    ty->specializations = spec_list(&tok, tok);
-  }
-
-  if (ty->kind != TY_GENERALIZATION) {
-    ty->kind = TY_STRUCT;
-  }
-
-  *rest = tok;
-
-  if (ty->size < 0)
-    return ty;
-
-  // Assign offsets within the struct to members.
+// Set offsets of struct members. Set size and alignment of struct itself.
+// Works on specializations too.
+static void struct_members_postprocess(Type *ty) {
   int bits = 0;
-
   for (Member *mem = ty->members; mem; mem = mem->next) {
     if (mem->is_bitfield && mem->bit_width == 0) {
       // Zero-width anonymous bitfield has a special meaning.
@@ -2767,6 +2756,32 @@ static Type *struct_decl(Token **rest, Token *tok) {
   }
 
   ty->size = align_to(bits, ty->align * 8) / 8;
+}
+
+// Also handles generalization parsing.
+//
+// struct-decl = struct-union-decl ("<" spec-list)?
+static Type *struct_decl(Token **rest, Token *tok) {
+  Type *ty = struct_union_decl(&tok, tok);
+
+  if (equal(tok, "<")) {
+    tok = skip(tok, "<");
+    ty->kind = TY_GENERALIZATION;
+    ty->size = -1; // incomplete type
+    ty->specializations = spec_list(&tok, tok);
+  }
+
+  if (ty->kind != TY_GENERALIZATION) {
+    ty->kind = TY_STRUCT;
+  }
+
+  *rest = tok;
+
+  if (ty->size < 0)
+    return ty;
+
+  struct_members_postprocess(ty);
+
   return ty;
 }
 
@@ -2810,6 +2825,107 @@ static Member *get_struct_member(Type *ty, Token *tok) {
   return NULL;
 }
 
+// Find specialization by name in a given generalization type.
+static Member *get_specialization(Type *gen, Token *name) {
+  for (Member *mem = gen->specializations; mem; mem = mem->next) {
+    if (mem->name->len == name->len &&
+        !strncmp(mem->name->loc, name->loc, name->len)) {
+      return mem;
+    }
+  }
+  return NULL;
+}
+
+// Resolve
+//
+// struct Generalization.x.y.z
+// GeneralizationTypedef.x.y.z
+//
+// to a complete struct-like type. Adds a "@" member to the end with a type of
+// chosen specialization, except when it's a void. Adds a int "__spec_id"
+// member to the begining. Something like this
+//
+// struct {
+//   int __spec_id;
+//   struct {}; // fields defined in struct section of generalization
+//   spec_type @;
+// };
+static Type *resolve_specialization(Token **rest, Token *tok, Type *basety) {
+  static Token at_token = (Token){
+    .kind = TK_IDENT,
+    .next = NULL,
+    .loc = "@",
+    .len = 1
+  };
+
+  static Token spec_id_token = (Token){
+    .kind = TK_IDENT,
+    .next = NULL,
+    .loc = "__spec_id",
+    .len = 9
+  };
+
+  tok = skip(tok, ".");
+  if (!tok || tok->kind != TK_IDENT) {
+    error_tok(tok, "expected specialization name");
+  }
+
+  Member *spec = get_specialization(basety, tok);
+  if (spec == NULL) {
+    error_tok(tok, "no such specialization was defined");
+  }
+  tok = tok->next;
+
+  Type *ty = struct_type();
+  ty->kind = TY_SPECIALIZATION;
+
+  int idx = 0; // field index
+  Member *spec_id_member;
+  Member *at_member;
+
+  // add "__spec_id" field
+  spec_id_member = ty->members = calloc(1, sizeof(struct Member));
+  *spec_id_member = (Member){
+    .next = NULL,
+    .ty = copy_type(ty_int),
+    .name = &spec_id_token,
+    .idx = idx++
+  };
+
+  // copy members from basety
+  Member **prev = &ty->members->next;
+  for (Member *mem = basety->members; mem; mem = mem->next) {
+    Member *new_mem = calloc(1, sizeof(Member));
+    *new_mem = *mem;
+    new_mem->idx = idx++;
+    *prev = new_mem;
+    prev = &new_mem->next;
+  }
+
+  // add "@" field
+  at_member = *prev = calloc(1, sizeof(Member));
+  *at_member = (Member){
+    .next = NULL,
+    .ty = spec->ty,
+    .name = &at_token,
+    .idx = idx++
+  };
+
+  // continue resolving if needed
+  if (at_member->ty->kind == TY_GENERALIZATION && equal(tok, ".")) {
+    at_member->ty = resolve_specialization(&tok, tok, at_member->ty);
+  }
+
+  at_member->align = at_member->ty->align;
+  spec_id_member->align = spec_id_member->ty->align;
+
+  struct_members_postprocess(ty);
+
+  *rest = tok;
+
+  return ty;
+}
+
 // Create a node representing a struct member access, such as foo.bar
 // where foo is a struct and bar is a member name.
 //
@@ -2825,8 +2941,10 @@ static Member *get_struct_member(Type *ty, Token *tok) {
 // This function takes care of anonymous structs.
 static Node *struct_ref(Node *node, Token *tok) {
   add_type(node);
-  if (node->ty->kind != TY_STRUCT && node->ty->kind != TY_UNION)
-    error_tok(node->tok, "not a struct nor a union");
+  if (node->ty->kind != TY_STRUCT && node->ty->kind != TY_UNION &&
+      node->ty->kind != TY_SPECIALIZATION) {
+    error_tok(node->tok, "not a struct, union or specialization");
+  }
 
   Type *ty = node->ty;
 
