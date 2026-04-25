@@ -2806,7 +2806,6 @@ static Type *struct_decl(Token **rest, Token *tok) {
   if (equal(tok, "<")) {
     tok = skip(tok, "<");
     ty->kind = TY_GENERALIZATION;
-    ty->size = -1; // incomplete type
     ty->specializations = spec_list(&tok, tok);
   }
 
@@ -2880,13 +2879,12 @@ static Member *get_specialization(Type *gen, Token *name) {
 // struct Generalization.x.y.z
 // GeneralizationTypedef.x.y.z
 //
-// to a complete struct-like type. Adds a "@" member to the end with a type of
-// chosen specialization, except when it's a void. Adds a int "__spec_id"
-// member to the begining. Something like this
+// to a complete struct-like type. Adds "__spec_id" and "@" members.
 //
 // struct {
+//   // fields defined in struct section of generalization
+//
 //   int __spec_id;
-//   struct {}; // fields defined in struct section of generalization
 //   spec_type @;
 // };
 static Type *resolve_specialization(Token **rest, Token *tok, Type *basety) {
@@ -2919,21 +2917,9 @@ static Type *resolve_specialization(Token **rest, Token *tok, Type *basety) {
   ty->kind = TY_SPECIALIZATION;
   ty->base = basety;
 
-  int idx = 0; // field index
-  Member *spec_id_member;
-  Member *at_member;
-
-  // add "__spec_id" field
-  spec_id_member = ty->members = calloc(1, sizeof(struct Member));
-  *spec_id_member = (Member){
-    .next = NULL,
-    .ty = copy_type(ty_int),
-    .name = &spec_id_token,
-    .idx = idx++
-  };
-
   // copy members from basety
-  Member **prev = &ty->members->next;
+  Member **prev = &ty->members;
+  int idx = 0; // field index
   for (Member *mem = basety->members; mem; mem = mem->next) {
     Member *new_mem = calloc(1, sizeof(Member));
     *new_mem = *mem;
@@ -2941,6 +2927,20 @@ static Type *resolve_specialization(Token **rest, Token *tok, Type *basety) {
     *prev = new_mem;
     prev = &new_mem->next;
   }
+
+  Member *spec_id_member;
+  Member *at_member;
+
+  // add "__spec_id" field
+  spec_id_member = *prev = calloc(1, sizeof(struct Member));
+  *spec_id_member = (Member){
+    .next = NULL,
+    .ty = copy_type(ty_int),
+    .name = &spec_id_token,
+    .idx = idx++
+  };
+
+  prev = &spec_id_member->next;
 
   // add "@" field
   at_member = *prev = calloc(1, sizeof(Member));
@@ -2982,8 +2982,8 @@ static Type *resolve_specialization(Token **rest, Token *tok, Type *basety) {
 static Node *struct_ref(Node *node, Token *tok) {
   add_type(node);
   if (node->ty->kind != TY_STRUCT && node->ty->kind != TY_UNION &&
-      node->ty->kind != TY_SPECIALIZATION) {
-    error_tok(node->tok, "not a struct, union or specialization");
+      node->ty->kind != TY_SPECIALIZATION && node->ty->kind != TY_GENERALIZATION) {
+    error_tok(node->tok, "not a struct, union, generalization or specialization");
   }
 
   Type *ty = node->ty;
