@@ -404,6 +404,7 @@ bool is_integer(Type *ty);
 bool is_flonum(Type *ty);
 bool is_numeric(Type *ty);
 bool is_compatible(Type *t1, Type *t2);
+bool is_generalized_function(Type *ty);
 Type *copy_type(Type *ty);
 Type *pointer_to(Type *base);
 Type *func_type(Type *return_ty);

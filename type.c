@@ -40,6 +40,10 @@ bool is_numeric(Type *ty) {
   return is_integer(ty) || is_flonum(ty);
 }
 
+bool is_generalized_function(Type *ty) {
+  return ty->kind == TY_FUNC && ty->spec_param_n > 0;
+}
+
 bool is_compatible(Type *t1, Type *t2) {
   if (t1 == t2)
     return true;
