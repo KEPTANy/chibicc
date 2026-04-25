@@ -661,10 +661,49 @@ static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
   return array_of(ty, eval(expr));
 }
 
-// type-suffix = "(" func-params
+// spec-func-params = param ("," param)* ">" "(" func-params
+// param            = declspec declarator
+Type *spec_func_params(Token **rest, Token *tok, Type *ty) {
+  Type head = {};
+  Type *cur = &head;
+  int cnt = 0;
+  while (!equal(tok, ">")) {
+    if (cur != &head)
+      tok = skip(tok, ",");
+
+    Token *old_token = tok;
+
+    Type *ty2 = declspec(&tok, tok, NULL);
+    ty2 = declarator(&tok, tok, ty2);
+
+    if (ty2->kind != TY_PTR ||
+        (ty2->base->kind != TY_GENERALIZATION && ty2->base->kind != TY_SPECIALIZATION)) {
+      error_tok(old_token, "generalization pointer or specialization pointer expected");
+    }
+
+    cur = cur->next = copy_type(ty2);
+    cnt++;
+  }
+
+  tok = skip(tok, ">");
+  tok = skip(tok, "(");
+  ty = func_params(rest, tok, ty);
+
+  cur->next = ty->params;
+
+  ty->params = head.next;
+  ty->spec_param_n = cnt;
+  return ty;
+}
+
+// type-suffix = "<" spec-func-params
+//             | "(" func-params
 //             | "[" array-dimensions
 //             | ε
 static Type *type_suffix(Token **rest, Token *tok, Type *ty) {
+  if (equal(tok, "<"))
+    return spec_func_params(rest, tok->next, ty);
+
   if (equal(tok, "("))
     return func_params(rest, tok->next, ty);
 
@@ -2878,6 +2917,7 @@ static Type *resolve_specialization(Token **rest, Token *tok, Type *basety) {
 
   Type *ty = struct_type();
   ty->kind = TY_SPECIALIZATION;
+  ty->base = basety;
 
   int idx = 0; // field index
   Member *spec_id_member;

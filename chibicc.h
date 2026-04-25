@@ -336,6 +336,8 @@ struct Type {
   // pointer or not. That means in many contexts "array of T" is
   // naturally handled as if it were "pointer to T", as required by
   // the C spec.
+  //
+  // For specialization types, points to original generalization.
   Type *base;
 
   // Declaration
@@ -360,6 +362,7 @@ struct Type {
   // Function type
   Type *return_ty;
   Type *params;
+  int spec_param_n;
   bool is_variadic;
   Type *next;
 };

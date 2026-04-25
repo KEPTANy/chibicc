@@ -106,6 +106,7 @@ Type *func_type(Type *return_ty) {
   // GCC allows that and the expression is evaluated to 1.
   Type *ty = new_type(TY_FUNC, 1, 1);
   ty->return_ty = return_ty;
+  ty->spec_param_n = 0;
   return ty;
 }
 
