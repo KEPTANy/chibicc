@@ -1579,6 +1579,18 @@ static void emit_text(Obj *prog) {
     println("  mov %%rbp, %%rsp");
     println("  pop %%rbp");
     println("  ret");
+
+    // Register constructor/destructor functions
+    if (fn->ty->is_constructor) {
+      println("  .section .init_array.%05d,\"aw\",@init_array", fn->ty->constructor_priority);
+      println("  .align 8");
+      println("  .quad %s", fn->name);
+    }
+    if (fn->ty->is_destructor) {
+      println("  .section .fini_array.%05d,\"aw\",@fini_array", fn->ty->destructor_priority);
+      println("  .align 8");
+      println("  .quad %s", fn->name);
+    }
   }
 }
 

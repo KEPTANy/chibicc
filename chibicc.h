@@ -365,6 +365,11 @@ struct Type {
   int spec_param_n;
   bool is_variadic;
   Type *next;
+
+  bool is_constructor; // __attribute((constructor(priority)))
+  int constructor_priority;
+  bool is_destructor; // __attribute((destructor(priority)))
+  int destructor_priority;
 };
 
 // Struct member

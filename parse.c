@@ -46,6 +46,11 @@ typedef struct {
   bool is_inline;
   bool is_tls;
   int align;
+
+  bool is_constructor;
+  int constructor_priority;
+  bool is_destructor;
+  int destructor_priority;
 } VarAttr;
 
 // This struct represents a variable initializer. Since initializers
@@ -107,6 +112,7 @@ static Node *current_switch;
 static Obj *builtin_alloca;
 
 static bool is_typename(Token *tok);
+static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr);
 static Type *declspec(Token **rest, Token *tok, VarAttr *attr);
 static Type *typename(Token **rest, Token *tok);
 static Type *enum_specifier(Token **rest, Token *tok);
@@ -403,6 +409,11 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
   bool is_atomic = false;
 
   while (is_typename(tok)) {
+    if (equal(tok, "__attribute__")) {
+      tok = attribute_list(tok, NULL, attr);
+      continue;
+    }
+
     // Handle storage class specifiers.
     if (equal(tok, "typedef") || equal(tok, "static") || equal(tok, "extern") ||
         equal(tok, "inline") || equal(tok, "_Thread_local") || equal(tok, "__thread")) {
@@ -726,7 +737,7 @@ static Type *pointers(Token **rest, Token *tok, Type *ty) {
   return ty;
 }
 
-// declarator = pointers ("(" ident ")" | "(" declarator ")" | ident) type-suffix
+// declarator = pointers ("(" ident ")" | "(" declarator ")" | ident) type-suffix attribute*
 static Type *declarator(Token **rest, Token *tok, Type *ty) {
   ty = pointers(&tok, tok, ty);
 
@@ -735,7 +746,9 @@ static Type *declarator(Token **rest, Token *tok, Type *ty) {
     Type dummy = {};
     declarator(&tok, start->next, &dummy);
     tok = skip(tok, ")");
-    ty = type_suffix(rest, tok, ty);
+    ty = type_suffix(&tok, tok, ty);
+    tok = attribute_list(tok, ty, NULL);
+    *rest = tok;
     return declarator(&tok, start->next, ty);
   }
 
@@ -747,7 +760,9 @@ static Type *declarator(Token **rest, Token *tok, Type *ty) {
     tok = tok->next;
   }
 
-  ty = type_suffix(rest, tok, ty);
+  ty = type_suffix(&tok, tok, ty);
+  tok = attribute_list(tok, ty, NULL);
+  *rest = tok;
   ty->name = name;
   ty->name_pos = name_pos;
   return ty;
@@ -1552,7 +1567,7 @@ static bool is_typename(Token *tok) {
       "typedef", "enum", "static", "extern", "_Alignas", "signed", "unsigned",
       "const", "volatile", "auto", "register", "restrict", "__restrict",
       "__restrict__", "_Noreturn", "float", "double", "typeof", "inline",
-      "_Thread_local", "__thread", "_Atomic",
+      "_Thread_local", "__thread", "_Atomic", "__attribute__"
     };
 
     for (int i = 0; i < sizeof(kw) / sizeof(*kw); i++)
@@ -2644,8 +2659,12 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
   ty->members = head.next;
 }
 
-// attribute = ("__attribute__" "(" "(" "packed" ")" ")")*
-static Token *attribute_list(Token *tok, Type *ty) {
+// attribute = ("__attribute__" "(" "(" attr ("," attr)* ")" ")")*
+// attr      = "packed"
+//           | "aligned" "(" const-expr ")"
+//           | "constructor" ("(" const-expr ")")?
+//           | "destructor" ("(" const-expr ")")?
+static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
   while (consume(&tok, tok, "__attribute__")) {
     tok = skip(tok, "(");
     tok = skip(tok, "(");
@@ -2658,14 +2677,57 @@ static Token *attribute_list(Token *tok, Type *ty) {
       first = false;
 
       if (consume(&tok, tok, "packed")) {
-        ty->is_packed = true;
+        if (ty) {
+          ty->is_packed = true;
+        }
         continue;
       }
 
       if (consume(&tok, tok, "aligned")) {
         tok = skip(tok, "(");
-        ty->align = const_expr(&tok, tok);
+        int align = const_expr(&tok, tok);
         tok = skip(tok, ")");
+        if (ty) {
+          ty->align = align;
+        }
+        continue;
+      }
+
+      if (consume(&tok, tok, "constructor")) {
+        int priority = 65535;
+        if (equal(tok, "(")) {
+          tok = skip(tok, "(");
+          priority = const_expr(&tok, tok);
+          tok = skip(tok, ")");
+        }
+
+        if (ty) {
+          ty->is_constructor = true;
+          ty->constructor_priority = priority;
+        }
+        if (attr) {
+          attr->is_constructor = true;
+          attr->constructor_priority = priority;
+        }
+        continue;
+      }
+
+      if (consume(&tok, tok, "destructor")) {
+        int priority = 65535;
+        if (equal(tok, "(")) {
+          tok = skip(tok, "(");
+          priority = const_expr(&tok, tok);
+          tok = skip(tok, ")");
+        }
+
+        if (ty) {
+          ty->is_destructor = true;
+          ty->destructor_priority = priority;
+        }
+        if (attr) {
+          attr->is_destructor = true;
+          attr->destructor_priority = priority;
+        }
         continue;
       }
 
@@ -2681,7 +2743,7 @@ static Token *attribute_list(Token *tok, Type *ty) {
 // struct-union-decl = attribute? ident? ("{" struct-members)?
 static Type *struct_union_decl(Token **rest, Token *tok) {
   Type *ty = struct_type();
-  tok = attribute_list(tok, ty);
+  tok = attribute_list(tok, ty, NULL);
 
   // Read a tag.
   Token *tag = NULL;
@@ -2706,7 +2768,7 @@ static Type *struct_union_decl(Token **rest, Token *tok) {
 
   // Construct a struct object.
   struct_members(&tok, tok, ty);
-  *rest = attribute_list(tok, ty);
+  *rest = attribute_list(tok, ty, NULL);
 
   if (tag) {
     // If this is a redefinition, overwrite a previous type.
@@ -3411,8 +3473,25 @@ static void mark_live(Obj *var) {
   }
 }
 
+// Copies __attribute__((constructor/destructor)) related info to a type.
+static void apply_cdtor(Type *ty, VarAttr *attr) {
+  if (!attr) {
+    return;
+  }
+  if (attr->is_constructor) {
+    ty->is_constructor = true;
+    ty->constructor_priority = attr->constructor_priority;
+  }
+  if (attr->is_destructor) {
+    ty->is_destructor = true;
+    ty->destructor_priority = attr->destructor_priority;
+  }
+}
+
 static Token *function(Token *tok, Type *basety, VarAttr *attr) {
   Type *ty = declarator(&tok, tok, basety);
+  tok = attribute_list(tok, ty, attr);
+  apply_cdtor(ty, attr);
   if (!ty->name)
     error_tok(ty->name_pos, "function name omitted");
   char *name_str = get_ident(ty->name);
@@ -3427,6 +3506,21 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
     if (!fn->is_static && attr->is_static)
       error_tok(tok, "static declaration follows a non-static declaration");
     fn->is_definition = fn->is_definition || equal(tok, "{");
+
+    // WARN:
+    // Depending on the placement of __attribute__((constructor/destructor)),
+    // info is either contained in already regietered function type, `ty` or
+    // `attr`. Just merge everything in for now, current implementation only
+    // saves one priority number, and doesnt indicate which one was saved.
+    apply_cdtor(fn->ty, attr);
+    if (ty->is_constructor) {
+      fn->ty->is_constructor = true;
+      fn->ty->constructor_priority = ty->constructor_priority;
+    }
+    if (ty->is_destructor) {
+      fn->ty->is_destructor = true;
+      fn->ty->destructor_priority = ty->destructor_priority;
+    }
   } else {
     fn = new_gvar(name_str, ty);
     fn->is_function = true;

@@ -1,6 +1,19 @@
 #include "test.h"
 #include "stddef.h"
 
+static int ctors;
+
+ static void __attribute__((constructor(200))) ctor_late(void) {
+  ctors = ctors * 10 + 2;
+}
+
+__attribute__((constructor(101))) static void ctor_early(void) {
+  ctors = ctors * 10 + 1;
+}
+
+static void dtor_fn(void) __attribute__((destructor(101)));
+static void dtor_fn(void) {}
+
 int main() {
   ASSERT(5, ({ struct { char a; int b; } __attribute__((packed)) x; sizeof(x); }));
   ASSERT(0, offsetof(struct __attribute__((packed)) { char a; int b; }, a));
@@ -33,6 +46,8 @@ int main() {
   ASSERT(1, offsetof(struct __attribute__((aligned(8))) { char a; int b; } __attribute__((packed)), b));
 
   ASSERT(16, ({ struct __attribute__((aligned(8+8))) { char a; int b; } x; _Alignof(x); }));
+
+  ASSERT(12, ctors);
 
   printf("OK\n");
   return 0;
