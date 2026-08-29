@@ -139,6 +139,7 @@ struct Obj {
   bool is_function;
   bool is_definition;
   bool is_static;
+  bool is_comdat;
 
   // Global variable
   bool is_tentative;
@@ -343,6 +344,13 @@ struct Type {
   // Declaration
   Token *name;
   Token *name_pos;
+
+  // Struct/union/generalization tag. Separate from name because
+  // declarator() overwrites name with the variable identifier.
+  Token *tag;
+
+  // For TY_SPECIALIZATION, the chosen specialization identifier.
+  Token *spec_name;
 
   // Array
   int array_len;

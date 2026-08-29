@@ -1477,12 +1477,18 @@ static void emit_text(Obj *prog) {
     if (!fn->is_live)
       continue;
 
-    if (fn->is_static)
-      println("  .local %s", fn->name);
-    else
+    if (fn->is_comdat) {
+      println("  .section .text.%s,\"axG\",@progbits,%s,comdat", fn->name, fn->name);
+      println("  .weak %s", fn->name);
       println("  .globl %s", fn->name);
+    } else if (fn->is_static) {
+      println("  .local %s", fn->name);
+      println("  .text");
+    } else {
+      println("  .globl %s", fn->name);
+      println("  .text");
+    }
 
-    println("  .text");
     println("  .type %s, @function", fn->name);
     println("%s:", fn->name);
     current_fn = fn;
@@ -1582,7 +1588,12 @@ static void emit_text(Obj *prog) {
 
     // Register constructor/destructor functions
     if (fn->ty->is_constructor) {
-      println("  .section .init_array.%05d,\"aw\",@init_array", fn->ty->constructor_priority);
+      if (fn->is_comdat)
+        println("  .section .init_array.%05d.%s,\"awG\",@init_array,%s,comdat",
+                fn->ty->constructor_priority, fn->name, fn->name);
+      else
+        println("  .section .init_array.%05d,\"aw\",@init_array",
+                fn->ty->constructor_priority);
       println("  .align 8");
       println("  .quad %s", fn->name);
     }

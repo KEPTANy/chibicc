@@ -111,6 +111,18 @@ static Node *current_switch;
 
 static Obj *builtin_alloca;
 
+typedef struct TypeList TypeList;
+struct TypeList {
+  TypeList *next;
+  Type *ty;
+};
+
+// Generalizations declared in this translation unit.
+static TypeList *generalizations;
+
+// Maps mangled specialization symbol names to Obj pointers.
+static HashMap spec_syms;
+
 static bool is_typename(Token *tok);
 static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr);
 static Type *declspec(Token **rest, Token *tok, VarAttr *attr);
@@ -153,7 +165,9 @@ static Node *cast(Token **rest, Token *tok);
 static Member *get_struct_member(Type *ty, Token *tok);
 static Type *struct_decl(Token **rest, Token *tok);
 static Type *union_decl(Token **rest, Token *tok);
+static Type *make_specialization(Type *basety, Member *spec);
 static Type *resolve_specialization(Token **rest, Token *tok, Type *basety);
+static Obj *ensure_spec_syms(Type *spec);
 static Node *postfix(Token **rest, Token *tok);
 static Node *funcall(Token **rest, Token *tok, Node *node);
 static Node *unary(Token **rest, Token *tok);
@@ -334,6 +348,63 @@ static Obj *new_gvar(char *name, Type *ty) {
 static char *new_unique_name(void) {
   static int id = 0;
   return format(".L..%d", id++);
+}
+
+static char *token_str(Token *tok) {
+  return strndup(tok->loc, tok->len);
+}
+
+// Untagged generalizations get a per-TU unique tag that won't merge across
+// object files.
+static Token *ensure_gen_tag(Type *gen) {
+  if (gen->kind == TY_SPECIALIZATION)
+    gen = gen->base;
+  if (!gen->tag) {
+    Token *tok = calloc(1, sizeof(Token));
+    tok->kind = TK_IDENT;
+    tok->loc = new_unique_name();
+    tok->len = strlen(tok->loc);
+    gen->tag = tok;
+  }
+  return gen->tag;
+}
+
+static char *mangle_gen_cnt(Type *gen) {
+  if (gen->kind == TY_SPECIALIZATION)
+    gen = gen->base;
+  return format("__spec_cnt.%s.s%d.a%d", token_str(ensure_gen_tag(gen)),
+                gen->size, gen->align);
+}
+
+static char *mangle_spec_id(Type *spec) {
+  return format("__spec_id.%s.%s.s%d.a%d",
+                token_str(ensure_gen_tag(spec->base)),
+                token_str(spec->spec_name), spec->size, spec->align);
+}
+
+static char *mangle_spec_reg(Type *spec) {
+  return format("__spec_reg.%s.%s.s%d.a%d",
+                token_str(ensure_gen_tag(spec->base)),
+                token_str(spec->spec_name), spec->size, spec->align);
+}
+
+static Obj *spec_sym_get(char *name) {
+  return hashmap_get(&spec_syms, name);
+}
+
+static void spec_sym_put(char *name, Obj *obj) {
+  hashmap_put(&spec_syms, name, obj);
+}
+
+static void record_generalization(Type *ty) {
+  for (TypeList *p = generalizations; p; p = p->next)
+    if (p->ty == ty)
+      return;
+
+  TypeList *e = calloc(1, sizeof(TypeList));
+  e->ty = ty;
+  e->next = generalizations;
+  generalizations = e;
 }
 
 static Obj *new_anon_gvar(Type *ty) {
@@ -2752,6 +2823,8 @@ static Type *struct_union_decl(Token **rest, Token *tok) {
     tok = tok->next;
   }
 
+  ty->tag = tag;
+
   if (tag && !equal(tok, "{")) {
     *rest = tok;
 
@@ -2776,6 +2849,7 @@ static Type *struct_union_decl(Token **rest, Token *tok) {
     Type *ty2 = hashmap_get2(&scope->tags, tag->loc, tag->len);
     if (ty2) {
       *ty2 = *ty;
+      ty2->tag = tag;
       return ty2;
     }
 
@@ -2869,6 +2943,7 @@ static Type *struct_decl(Token **rest, Token *tok) {
     tok = skip(tok, "<");
     ty->kind = TY_GENERALIZATION;
     ty->specializations = spec_list(&tok, tok);
+    record_generalization(ty);
   }
 
   if (ty->kind != TY_GENERALIZATION) {
@@ -2936,20 +3011,8 @@ static Member *get_specialization(Type *gen, Token *name) {
   return NULL;
 }
 
-// Resolve
-//
-// struct Generalization.x.y.z
-// GeneralizationTypedef.x.y.z
-//
-// to a complete struct-like type. Adds "__spec_id" and "@" members.
-//
-// struct {
-//   // fields defined in struct section of generalization
-//
-//   int __spec_id;
-//   spec_type @;
-// };
-static Type *resolve_specialization(Token **rest, Token *tok, Type *basety) {
+// Build a specialization type for basety.spec. Adds "__spec_id" and "@" members.
+static Type *make_specialization(Type *basety, Member *spec) {
   static Token at_token = (Token){
     .kind = TK_IDENT,
     .next = NULL,
@@ -2964,6 +3027,162 @@ static Type *resolve_specialization(Token **rest, Token *tok, Type *basety) {
     .len = 9
   };
 
+  Type *ty = struct_type();
+  ty->kind = TY_SPECIALIZATION;
+  ty->base = basety;
+  ty->tag = basety->tag;
+  ty->spec_name = spec->name;
+
+  Member **prev = &ty->members;
+  int idx = 0;
+  for (Member *mem = basety->members; mem; mem = mem->next) {
+    Member *new_mem = calloc(1, sizeof(Member));
+    *new_mem = *mem;
+    new_mem->idx = idx++;
+    *prev = new_mem;
+    prev = &new_mem->next;
+  }
+
+  Member *spec_id_member = *prev = calloc(1, sizeof(Member));
+  *spec_id_member = (Member){
+    .next = NULL,
+    .ty = copy_type(ty_int),
+    .name = &spec_id_token,
+    .idx = idx++
+  };
+  prev = &spec_id_member->next;
+
+  Member *at_member = *prev = calloc(1, sizeof(Member));
+  *at_member = (Member){
+    .next = NULL,
+    .ty = spec->ty,
+    .name = &at_token,
+    .idx = idx++
+  };
+
+  at_member->align = at_member->ty->align;
+  spec_id_member->align = spec_id_member->ty->align;
+  struct_members_postprocess(ty);
+  return ty;
+}
+
+static Obj *new_spec_gvar(char *name, Type *ty) {
+  Obj *var = calloc(1, sizeof(Obj));
+  var->name = name;
+  var->ty = ty;
+  var->align = ty->align;
+  var->is_definition = true;
+  var->next = globals;
+  globals = var;
+  return var;
+}
+
+static Obj *intern_gen_cnt(Type *gen) {
+  if (gen->kind == TY_SPECIALIZATION)
+    gen = gen->base;
+  char *name = mangle_gen_cnt(gen);
+  Obj *obj = spec_sym_get(name);
+  if (obj)
+    return obj;
+
+  obj = new_spec_gvar(name, ty_int);
+  obj->is_tentative = true;
+  spec_sym_put(name, obj);
+  return obj;
+}
+
+static void create_spec_ctor(Type *spec, Obj *spec_id, Obj *counter) {
+  char *name = mangle_spec_reg(spec);
+  if (spec_sym_get(name))
+    return;
+
+  Token *tok = spec->spec_name;
+  Type *ty = func_type(ty_void);
+  ty->is_constructor = true;
+  ty->constructor_priority = 101;
+
+  Obj *fn = new_spec_gvar(name, ty);
+  fn->is_function = true;
+  fn->is_definition = true;
+  fn->is_comdat = true;
+  fn->is_root = true;
+  fn->is_live = true;
+  fn->tok = tok;
+  spec_sym_put(name, fn);
+
+  Obj *alloca_bottom = calloc(1, sizeof(Obj));
+  alloca_bottom->name = "__alloca_size__";
+  alloca_bottom->ty = pointer_to(ty_char);
+  alloca_bottom->align = 8;
+  alloca_bottom->is_local = true;
+  fn->alloca_bottom = alloca_bottom;
+  fn->locals = alloca_bottom;
+
+  Node *ret = new_node(ND_RETURN, tok);
+
+  Node *ifn = new_node(ND_IF, tok);
+  ifn->cond = new_var_node(spec_id, tok);
+  add_type(ifn->cond);
+  ifn->then = ret;
+
+  Node *inc = new_binary(ND_ASSIGN, new_var_node(counter, tok),
+                         new_add(new_var_node(counter, tok), new_num(1, tok), tok),
+                         tok);
+  add_type(inc);
+  Node *inc_stmt = new_unary(ND_EXPR_STMT, inc, tok);
+
+  Node *set = new_binary(ND_ASSIGN, new_var_node(spec_id, tok),
+                         new_var_node(counter, tok), tok);
+  add_type(set);
+  Node *set_stmt = new_unary(ND_EXPR_STMT, set, tok);
+
+  ifn->next = inc_stmt;
+  inc_stmt->next = set_stmt;
+
+  Node *body = new_node(ND_BLOCK, tok);
+  body->body = ifn;
+  fn->body = body;
+}
+
+static Obj *ensure_spec_syms(Type *spec) {
+  Obj *counter = intern_gen_cnt(spec->base);
+  char *id_name = mangle_spec_id(spec);
+  Obj *spec_id = spec_sym_get(id_name);
+  if (spec_id)
+    return spec_id;
+
+  spec_id = new_spec_gvar(id_name, ty_int);
+  spec_id->is_tentative = true;
+  spec_id->tok = spec->spec_name;
+  spec_sym_put(id_name, spec_id);
+  create_spec_ctor(spec, spec_id, counter);
+  return spec_id;
+}
+
+static void emit_declared_spec_syms(void) {
+  for (TypeList *p = generalizations; p; p = p->next) {
+    Type *gen = p->ty;
+    if (gen->size < 0)
+      continue;
+    for (Member *mem = gen->specializations; mem; mem = mem->next)
+      ensure_spec_syms(make_specialization(gen, mem));
+  }
+}
+
+// Resolve
+//
+// struct Generalization.x.y.z
+// GeneralizationTypedef.x.y.z
+//
+// to a complete struct-like type. Adds "__spec_id" and "@" members.
+//
+// struct {
+//   // fields defined in struct section of generalization
+//
+//   int __spec_id;
+//   spec_type @;
+// };
+static Type *resolve_specialization(Token **rest, Token *tok, Type *basety) {
   tok = skip(tok, ".");
   if (!tok || tok->kind != TK_IDENT) {
     error_tok(tok, "expected specialization name");
@@ -2975,56 +3194,19 @@ static Type *resolve_specialization(Token **rest, Token *tok, Type *basety) {
   }
   tok = tok->next;
 
-  Type *ty = struct_type();
-  ty->kind = TY_SPECIALIZATION;
-  ty->base = basety;
+  Type *ty = make_specialization(basety, spec);
 
-  // copy members from basety
-  Member **prev = &ty->members;
-  int idx = 0; // field index
-  for (Member *mem = basety->members; mem; mem = mem->next) {
-    Member *new_mem = calloc(1, sizeof(Member));
-    *new_mem = *mem;
-    new_mem->idx = idx++;
-    *prev = new_mem;
-    prev = &new_mem->next;
-  }
+  Member *at_member = ty->members;
+  while (at_member->next)
+    at_member = at_member->next;
 
-  Member *spec_id_member;
-  Member *at_member;
-
-  // add "__spec_id" field
-  spec_id_member = *prev = calloc(1, sizeof(struct Member));
-  *spec_id_member = (Member){
-    .next = NULL,
-    .ty = copy_type(ty_int),
-    .name = &spec_id_token,
-    .idx = idx++
-  };
-
-  prev = &spec_id_member->next;
-
-  // add "@" field
-  at_member = *prev = calloc(1, sizeof(Member));
-  *at_member = (Member){
-    .next = NULL,
-    .ty = spec->ty,
-    .name = &at_token,
-    .idx = idx++
-  };
-
-  // continue resolving if needed
   if (at_member->ty->kind == TY_GENERALIZATION && equal(tok, ".")) {
     at_member->ty = resolve_specialization(&tok, tok, at_member->ty);
+    at_member->align = at_member->ty->align;
+    struct_members_postprocess(ty);
   }
 
-  at_member->align = at_member->ty->align;
-  spec_id_member->align = spec_id_member->ty->align;
-
-  struct_members_postprocess(ty);
-
   *rest = tok;
-
   return ty;
 }
 
@@ -3249,6 +3431,7 @@ static Node *generic_selection(Token **rest, Token *tok) {
 //         | "(" expr ")"
 //         | "sizeof" "(" type-name ")"
 //         | "sizeof" unary
+//         | "spec_id_of" "(" type-name ")"
 //         | "_Alignof" "(" type-name ")"
 //         | "_Alignof" unary
 //         | "_Generic" generic-selection
@@ -3288,6 +3471,15 @@ static Node *primary(Token **rest, Token *tok) {
     }
 
     return new_ulong(ty->size, start);
+  }
+
+  if (equal(tok, "spec_id_of")) {
+    tok = skip(tok->next, "(");
+    Type *ty = typename(&tok, tok);
+    *rest = skip(tok, ")");
+    if (ty->kind != TY_SPECIALIZATION)
+      error_tok(start, "specialized type expected");
+    return new_var_node(ensure_spec_syms(ty), start);
   }
 
   if (equal(tok, "sizeof")) {
@@ -3705,6 +3897,8 @@ static void declare_builtin_functions(void) {
 Obj *parse(Token *tok) {
   declare_builtin_functions();
   globals = NULL;
+  generalizations = NULL;
+  spec_syms = (HashMap){};
 
   while (tok->kind != TK_EOF) {
     if (is_extension(tok)) {
@@ -3730,6 +3924,8 @@ Obj *parse(Token *tok) {
     // Global variable
     tok = global_variable(tok, basety, &attr);
   }
+
+  emit_declared_spec_syms();
 
   for (Obj *var = globals; var; var = var->next)
     if (var->is_root)
