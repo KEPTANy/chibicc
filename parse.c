@@ -3159,6 +3159,99 @@ static Obj *ensure_spec_syms(Type *spec) {
   return spec_id;
 }
 
+static Type *generalization_of(Type *ty) {
+  if (ty->kind == TY_SPECIALIZATION)
+    return ty->base;
+  if (ty->kind == TY_GENERALIZATION)
+    return ty;
+  return NULL;
+}
+
+static bool same_generalization(Type *t1, Type *t2) {
+  t1 = generalization_of(t1);
+  t2 = generalization_of(t2);
+  if (!t1 || !t2)
+    return false;
+  return !strcmp(mangle_gen_cnt(t1), mangle_gen_cnt(t2));
+}
+
+static bool same_specialization(Type *t1, Type *t2) {
+  if (t1->kind != TY_SPECIALIZATION || t2->kind != TY_SPECIALIZATION)
+    return false;
+  return !strcmp(mangle_spec_id(t1), mangle_spec_id(t2));
+}
+
+static Type *ensure_spec_id(Type *ty) {
+  if (ty->kind == TY_SPECIALIZATION)
+    return ty;
+  if (ty->kind != TY_GENERALIZATION)
+    return NULL;
+
+
+  static Token spec_id_token = (Token){
+    .kind = TK_IDENT,
+    .next = NULL,
+    .loc = "__spec_id",
+    .len = 9
+  };
+
+  Type *view = struct_type();
+  view->is_packed = ty->is_packed;
+  view->align = ty->align;
+  view->tag = ty->tag;
+
+  Member **prev = &view->members;
+  int idx = 0;
+  for (Member *mem = ty->members; mem; mem = mem->next) {
+    Member *new_mem = calloc(1, sizeof(Member));
+    *new_mem = *mem;
+    new_mem->idx = idx++;
+    *prev = new_mem;
+    prev = &new_mem->next;
+  }
+
+  Member *spec_id_member = *prev = calloc(1, sizeof(Member));
+  *spec_id_member = (Member){
+    .ty = copy_type(ty_int),
+    .name = &spec_id_token,
+    .idx = idx,
+    .align = ty_int->align,
+  };
+  struct_members_postprocess(view);
+  return view;
+}
+
+static Node *spec_id_from_ptr(Node *ptr, Token *tok) {
+  static Token spec_id_token = (Token){
+    .kind = TK_IDENT,
+    .next = NULL,
+    .loc = "__spec_id",
+    .len = 9
+  };
+
+  add_type(ptr);
+  if (ptr->ty->kind != TY_PTR)
+    error_tok(tok, "pointer expected");
+
+  Type *obj_ty = ensure_spec_id(ptr->ty->base);
+  if (!obj_ty)
+    error_tok(tok, "generalization pointer or specialization pointer expected");
+
+  if (!same_specialization(ptr->ty->base, obj_ty))
+    ptr = new_cast(ptr, pointer_to(obj_ty));
+
+  Node *deref = new_unary(ND_DEREF, ptr, tok);
+  add_type(deref);
+
+  Member *mem = get_struct_member(deref->ty, &spec_id_token);
+  if (!mem)
+    error_tok(tok, "__spec_id member expected");
+
+  Node *node = new_unary(ND_MEMBER, deref, tok);
+  node->member = mem;
+  return node;
+}
+
 static void emit_declared_spec_syms(void) {
   for (TypeList *p = generalizations; p; p = p->next) {
     Type *gen = p->ty;
@@ -3432,6 +3525,9 @@ static Node *generic_selection(Token **rest, Token *tok) {
 //         | "sizeof" "(" type-name ")"
 //         | "sizeof" unary
 //         | "spec_id_of" "(" type-name ")"
+//         | "init_spec" "(" type-name "," assign ")"
+//         | "get_spec_size" "(" type-name ")"
+//         | "spec_index_cmp" "(" assign "," assign ")"
 //         | "_Alignof" "(" type-name ")"
 //         | "_Alignof" unary
 //         | "_Generic" generic-selection
@@ -3480,6 +3576,67 @@ static Node *primary(Token **rest, Token *tok) {
     if (ty->kind != TY_SPECIALIZATION)
       error_tok(start, "specialized type expected");
     return new_var_node(ensure_spec_syms(ty), start);
+  }
+
+  if (equal(tok, "init_spec")) {
+    tok = skip(tok->next, "(");
+    Type *ty = typename(&tok, tok);
+    tok = skip(tok, ",");
+    Node *ptr = assign(&tok, tok);
+    *rest = skip(tok, ")");
+
+    if (ty->kind != TY_SPECIALIZATION)
+      error_tok(start, "specialized type expected");
+
+    add_type(ptr);
+    if (ptr->ty->kind != TY_PTR || ptr->ty->base->kind != TY_SPECIALIZATION)
+      error_tok(start, "specialization pointer expected");
+    if (!same_specialization(ty, ptr->ty->base))
+      error_tok(start, "pointer type does not match specialization");
+
+    return new_binary(ND_ASSIGN, spec_id_from_ptr(ptr, start),
+                      new_var_node(ensure_spec_syms(ty), start), start);
+  }
+
+  if (equal(tok, "get_spec_size")) {
+    tok = skip(tok->next, "(");
+    Type *ty = typename(&tok, tok);
+    *rest = skip(tok, ")");
+    if (ty->kind != TY_GENERALIZATION)
+      error_tok(start, "generalization type expected");
+    return new_var_node(intern_gen_cnt(ty), start);
+  }
+
+  if (equal(tok, "spec_index_cmp")) {
+    tok = skip(tok->next, "(");
+    Node *p1 = assign(&tok, tok);
+    tok = skip(tok, ",");
+    Node *p2 = assign(&tok, tok);
+    *rest = skip(tok, ")");
+
+    add_type(p1);
+    add_type(p2);
+
+    if (p1->ty->kind != TY_PTR || !generalization_of(p1->ty->base) ||
+        p2->ty->kind != TY_PTR || !generalization_of(p2->ty->base))
+      error_tok(start, "generalization pointer or specialization pointer expected");
+    if (!same_generalization(p1->ty->base, p2->ty->base))
+      error_tok(start, "pointers to the same generalization expected");
+
+    Obj *t1 = new_lvar("", p1->ty);
+    Obj *t2 = new_lvar("", p2->ty);
+    Node *s1 = new_binary(ND_ASSIGN, new_var_node(t1, start), p1, start);
+    Node *s2 = new_binary(ND_ASSIGN, new_var_node(t2, start), p2, start);
+
+    Node *id1 = spec_id_from_ptr(new_var_node(t1, start), start);
+    Node *id2 = spec_id_from_ptr(new_var_node(t2, start), start);
+
+    Node *cond = new_node(ND_COND, start);
+    cond->cond = new_binary(ND_EQ, id1, id2, start);
+    cond->then = spec_id_from_ptr(new_var_node(t1, start), start);
+    cond->els = new_num(-1, start);
+
+    return new_binary(ND_COMMA, s1, new_binary(ND_COMMA, s2, cond, start), start);
   }
 
   if (equal(tok, "sizeof")) {
