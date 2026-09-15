@@ -169,13 +169,16 @@ static Type *make_specialization(Type *basety, Member *spec);
 static Type *resolve_specialization(Token **rest, Token *tok, Type *basety);
 static Obj *ensure_spec_syms(Type *spec);
 static Node *postfix(Token **rest, Token *tok);
-static Node *funcall(Token **rest, Token *tok, Node *node);
+static Node *funcall(Token **rest, Token *tok, Node *node, Node *pre_arg);
 static Node *unary(Token **rest, Token *tok);
 static Node *primary(Token **rest, Token *tok);
 static Token *parse_typedef(Token *tok, Type *basety);
 static bool is_function(Token *tok);
 static Token *function(Token *tok, Type *basety, VarAttr *attr);
 static Token *global_variable(Token *tok, Type *basety, VarAttr *attr);
+static Obj *find_func(char *name);
+static void create_param_lvars(Type *param);
+static void resolve_goto_labels(void);
 
 static int align_down(int n, int align) {
   return align_to(n - align + 1, align);
@@ -384,6 +387,19 @@ static char *mangle_spec_id(Type *spec) {
 
 static char *mangle_spec_reg(Type *spec) {
   return format("__spec_reg.%s.%s.s%d.a%d",
+                token_str(ensure_gen_tag(spec->base)),
+                token_str(spec->spec_name), spec->size, spec->align);
+}
+
+// Symbols shared by every variation of a parametric function.
+static char *mangle_param_func_family(char *kind, char *name, Type *gen) {
+  return format("%s.%s.%s.s%d.a%d", kind, name, token_str(ensure_gen_tag(gen)),
+                gen->size, gen->align);
+}
+
+// Symbols of one specialized variation.
+static char *mangle_param_func_spec(char *kind, char *name, Type *spec) {
+  return format("%s.%s.%s.%s.s%d.a%d", kind, name,
                 token_str(ensure_gen_tag(spec->base)),
                 token_str(spec->spec_name), spec->size, spec->align);
 }
@@ -3091,15 +3107,11 @@ static Obj *intern_gen_cnt(Type *gen) {
   return obj;
 }
 
-static void create_spec_ctor(Type *spec, Obj *spec_id, Obj *counter) {
-  char *name = mangle_spec_reg(spec);
-  if (spec_sym_get(name))
-    return;
-
-  Token *tok = spec->spec_name;
+// Empty COMDAT constructor function of the given priority.
+static Obj *new_ctor_fn(char *name, int priority, Token *tok) {
   Type *ty = func_type(ty_void);
   ty->is_constructor = true;
-  ty->constructor_priority = 101;
+  ty->constructor_priority = priority;
 
   Obj *fn = new_spec_gvar(name, ty);
   fn->is_function = true;
@@ -3108,7 +3120,6 @@ static void create_spec_ctor(Type *spec, Obj *spec_id, Obj *counter) {
   fn->is_root = true;
   fn->is_live = true;
   fn->tok = tok;
-  spec_sym_put(name, fn);
 
   Obj *alloca_bottom = calloc(1, sizeof(Obj));
   alloca_bottom->name = "__alloca_size__";
@@ -3117,6 +3128,17 @@ static void create_spec_ctor(Type *spec, Obj *spec_id, Obj *counter) {
   alloca_bottom->is_local = true;
   fn->alloca_bottom = alloca_bottom;
   fn->locals = alloca_bottom;
+  return fn;
+}
+
+static void create_spec_ctor(Type *spec, Obj *spec_id, Obj *counter) {
+  char *name = mangle_spec_reg(spec);
+  if (spec_sym_get(name))
+    return;
+
+  Token *tok = spec->spec_name;
+  Obj *fn = new_ctor_fn(name, 101, tok);
+  spec_sym_put(name, fn);
 
   Node *ret = new_node(ND_RETURN, tok);
 
@@ -3252,6 +3274,339 @@ static Node *spec_id_from_ptr(Node *ptr, Token *tok) {
   return node;
 }
 
+// Parametric functions
+//
+// Every variation of a parametric function is compiled as an ordinary
+// function. Dispatch goes through a table of function pointers indexed by __spec_id:
+//
+// Three levels of constructors are used to build the table.
+//
+//   101  __param_func_def.<f>.<gen> = &<default variation>
+//   102  __param_func_tbl.<f>.<gen> = calloc(__spec_cnt + 1, 8), then fill with the default
+//   103  __param_func_tbl.<f>.<gen>[__spec_id.<gen>.<spec>] = &<variation>
+
+static Obj *intern_param_calloc(void) {
+  Obj *obj = spec_sym_get("__param_func_calloc");
+  if (obj)
+    return obj;
+
+  Type *ty = func_type(pointer_to(ty_void));
+  Type *nmemb = copy_type(ty_ulong);
+  nmemb->next = copy_type(ty_ulong);
+  ty->params = nmemb;
+
+  obj = new_spec_gvar("calloc", ty);
+  obj->is_function = true;
+  obj->is_definition = false;
+  spec_sym_put("__param_func_calloc", obj);
+  return obj;
+}
+
+typedef struct {
+  char *name;
+  Type *gen;       // Generalization the specialized parameter belongs to
+  Type *fn_ty;     // Canonical function type shared by all variations
+  Type *fn_ptr_ty; // Pointer to fn_ty, i.e. the dispatch table element type
+  Obj *tbl;
+  Obj *def;
+  HashMap impls;   // Mangled variation name -> Obj, to catch redefinitions
+} ParamFunc;
+
+// Parametric functions declared in this translation unit, by source name.
+static HashMap param_funcs;
+
+// All variations of a family share one type in which the specialized
+// parameter is a pointer to the generalization.
+static Type *param_func_canon_type(Type *ty, Type *gen) {
+  Type *canon = func_type(ty->return_ty);
+  canon->is_variadic = ty->is_variadic;
+  canon->spec_param_n = ty->spec_param_n;
+  canon->params = pointer_to(gen);
+
+  Type *cur = canon->params;
+  for (Type *param = ty->params->next; param; param = param->next)
+    cur = cur->next = copy_type(param);
+  return canon;
+}
+
+// __attribute__((constructor(102))) void __param_func_tbl_init(void) {
+//   if (!tbl)
+//     tbl = calloc(cnt + 1, 8);
+//   if (def)
+//     for (i = 0; i <= cnt; i++)
+//       tbl[i] = def;
+// }
+static void create_param_func_tbl_ctor(ParamFunc *pf, Token *tok) {
+  Obj *fn = new_ctor_fn(mangle_param_func_family("__param_func_tbl_init",
+                                                 pf->name, pf->gen),
+                        102, tok);
+  Obj *cnt = intern_gen_cnt(pf->gen);
+
+  Node *size = new_cast(new_add(new_var_node(cnt, tok), new_num(1, tok), tok),
+                        ty_ulong);
+  size->next = new_ulong(pf->fn_ptr_ty->size, tok);
+
+  Obj *calloc_fn = intern_param_calloc();
+  Node *call = new_unary(ND_FUNCALL, new_var_node(calloc_fn, tok), tok);
+  call->func_ty = calloc_fn->ty;
+  call->args = size;
+
+  Node *alloc = new_binary(ND_ASSIGN, new_var_node(pf->tbl, tok),
+                           new_cast(call, pf->tbl->ty), tok);
+  add_type(alloc);
+
+  Node *if_alloc = new_node(ND_IF, tok);
+  if_alloc->cond = new_unary(ND_NOT, new_var_node(pf->tbl, tok), tok);
+  add_type(if_alloc->cond);
+  if_alloc->then = new_unary(ND_EXPR_STMT, alloc, tok);
+
+  Obj *idx = calloc(1, sizeof(Obj));
+  idx->name = "";
+  idx->ty = ty_int;
+  idx->align = ty_int->align;
+  idx->is_local = true;
+  idx->next = fn->locals;
+  fn->locals = idx;
+
+  Node *fill = new_node(ND_FOR, tok);
+  fill->brk_label = new_unique_name();
+  fill->cont_label = new_unique_name();
+
+  Node *init = new_binary(ND_ASSIGN, new_var_node(idx, tok), new_num(0, tok), tok);
+  add_type(init);
+  fill->init = new_unary(ND_EXPR_STMT, init, tok);
+
+  fill->cond = new_binary(ND_LE, new_var_node(idx, tok), new_var_node(cnt, tok), tok);
+  add_type(fill->cond);
+
+  fill->inc = new_binary(ND_ASSIGN, new_var_node(idx, tok),
+                         new_add(new_var_node(idx, tok), new_num(1, tok), tok),
+                         tok);
+  add_type(fill->inc);
+
+  Node *slot = new_unary(ND_DEREF,
+                         new_add(new_var_node(pf->tbl, tok),
+                                 new_var_node(idx, tok), tok),
+                         tok);
+  Node *store = new_binary(ND_ASSIGN, slot, new_var_node(pf->def, tok), tok);
+  add_type(store);
+  fill->then = new_unary(ND_EXPR_STMT, store, tok);
+
+  Node *if_def = new_node(ND_IF, tok);
+  if_def->cond = new_var_node(pf->def, tok);
+  add_type(if_def->cond);
+  if_def->then = fill;
+
+  if_alloc->next = if_def;
+
+  Node *body = new_node(ND_BLOCK, tok);
+  body->body = if_alloc;
+  fn->body = body;
+}
+
+static ParamFunc *intern_param_func(char *name, Type *ty, Token *tok) {
+  Type *gen = generalization_of(ty->params->base);
+  if (!gen)
+    error_tok(tok, "generalization pointer or specialization pointer expected");
+
+  ParamFunc *pf = hashmap_get(&param_funcs, name);
+  if (pf) {
+    if (!same_generalization(pf->gen, gen))
+      error_tok(tok, "parametric function '%s' redeclared for a different"
+                " generalization", name);
+    if (!is_compatible(pf->fn_ty, param_func_canon_type(ty, pf->gen)))
+      error_tok(tok, "conflicting types for parametric function '%s'", name);
+    return pf;
+  }
+
+  Obj *clash = find_func(name);
+  if (clash)
+    error_tok(tok, "redeclared as a different kind of symbol");
+
+  pf = calloc(1, sizeof(ParamFunc));
+  pf->name = name;
+  pf->gen = gen;
+  pf->fn_ty = param_func_canon_type(ty, gen);
+  pf->fn_ptr_ty = pointer_to(pf->fn_ty);
+
+  pf->tbl = new_spec_gvar(mangle_param_func_family("__param_func_tbl", name, gen),
+                          pointer_to(pf->fn_ptr_ty));
+  pf->tbl->is_tentative = true;
+  pf->tbl->tok = tok;
+
+  pf->def = new_spec_gvar(mangle_param_func_family("__param_func_def", name, gen),
+                          pf->fn_ptr_ty);
+  pf->def->is_tentative = true;
+  pf->def->tok = tok;
+
+  // A placeholder in the ordinary namespace, so that a call site finds the
+  // family by name like any other function. It is never emitted.
+  Obj *family = new_gvar(name, pf->fn_ty);
+  family->is_function = true;
+  family->is_definition = false;
+  family->is_static = false;
+  family->is_root = false;
+
+  hashmap_put(&param_funcs, name, pf);
+  create_param_func_tbl_ctor(pf, tok);
+  return pf;
+}
+
+// def = &impl;
+//
+// This runs at the same priority as the specialization id constructors
+// because nothing reads it until the table is built at priority 102.
+static void create_param_func_setdef_ctor(ParamFunc *pf, Obj *impl, Token *tok) {
+  Obj *fn = new_ctor_fn(mangle_param_func_family("__param_func_setdef",
+                                                 pf->name, pf->gen),
+                        101, tok);
+
+  Node *set = new_binary(ND_ASSIGN, new_var_node(pf->def, tok),
+                         new_cast(new_var_node(impl, tok), pf->fn_ptr_ty), tok);
+  add_type(set);
+
+  Node *body = new_node(ND_BLOCK, tok);
+  body->body = new_unary(ND_EXPR_STMT, set, tok);
+  fn->body = body;
+}
+
+// tbl[spec_id] = &impl;
+//
+// Runs after the table has been filled with the default, so a variation
+// always wins over it.
+static void create_param_func_reg_ctor(ParamFunc *pf, Type *spec, Obj *impl,
+                                       Token *tok) {
+  Obj *fn = new_ctor_fn(mangle_param_func_spec("__param_func_reg", pf->name, spec),
+                        103, tok);
+
+  Node *slot = new_unary(ND_DEREF,
+                         new_add(new_var_node(pf->tbl, tok),
+                                 new_var_node(ensure_spec_syms(spec), tok), tok),
+                         tok);
+  Node *set = new_binary(ND_ASSIGN, slot,
+                         new_cast(new_var_node(impl, tok), pf->fn_ptr_ty), tok);
+  add_type(set);
+
+  Node *body = new_node(ND_BLOCK, tok);
+  body->body = new_unary(ND_EXPR_STMT, set, tok);
+  fn->body = body;
+}
+
+// Declares or defines one variation of a parametric function. A variation
+// whose specialized parameter is a generalization pointer is the default
+// used by every specialization that has no variation of its own.
+static Token *param_function(Token *tok, Type *ty, char *name, VarAttr *attr) {
+  Token *name_tok = ty->name;
+
+  if (ty->spec_param_n != 1)
+    error_tok(name_tok, "parametric function must take exactly one"
+              " specialized parameter");
+  if (attr->is_static || attr->is_inline)
+    error_tok(name_tok, "parametric function cannot be static or inline");
+  if (ty->is_constructor || ty->is_destructor ||
+      attr->is_constructor || attr->is_destructor)
+    error_tok(name_tok, "parametric function cannot be a constructor"
+              " or a destructor");
+
+  ParamFunc *pf = intern_param_func(name, ty, name_tok);
+  Type *target = ty->params->base;
+
+  if (consume(&tok, tok, ";"))
+    return tok;
+
+  bool is_default = target->kind == TY_GENERALIZATION;
+  char *impl_name =
+    is_default ? mangle_param_func_family("__param_func", name, pf->gen)
+               : mangle_param_func_spec("__param_func", name, target);
+
+  if (hashmap_get(&pf->impls, impl_name))
+    error_tok(name_tok, "redefinition of %s", name);
+
+  Obj *fn = new_spec_gvar(impl_name, ty);
+  fn->is_function = true;
+  fn->is_definition = true;
+  fn->is_comdat = true;
+  fn->is_root = true;
+  fn->is_live = true;
+  fn->tok = name_tok;
+  hashmap_put(&pf->impls, impl_name, fn);
+
+  if (is_default)
+    create_param_func_setdef_ctor(pf, fn, name_tok);
+  else
+    create_param_func_reg_ctor(pf, target, fn, name_tok);
+
+  current_fn = fn;
+  locals = NULL;
+  enter_scope();
+  create_param_lvars(ty->params);
+
+  Type *rty = ty->return_ty;
+  if ((rty->kind == TY_STRUCT || rty->kind == TY_UNION) && rty->size > 16)
+    new_lvar("", pointer_to(rty));
+
+  fn->params = locals;
+
+  if (ty->is_variadic)
+    fn->va_area = new_lvar("__va_area__", array_of(ty_char, 136));
+  fn->alloca_bottom = new_lvar("__alloca_size__", pointer_to(ty_char));
+
+  tok = skip(tok, "{");
+
+  push_scope("__func__")->var =
+    new_string_literal(name, array_of(ty_char, strlen(name) + 1));
+  push_scope("__FUNCTION__")->var =
+    new_string_literal(name, array_of(ty_char, strlen(name) + 1));
+
+  fn->body = compound_stmt(&tok, tok);
+  fn->locals = locals;
+  leave_scope();
+  resolve_goto_labels();
+  return tok;
+}
+
+static bool is_param_func_node(Node *node) {
+  return node->kind == ND_VAR && node->var->is_function &&
+         node->var->ty->kind == TY_FUNC && node->var->ty->spec_param_n > 0;
+}
+
+// A call to a parametric function evaluates the specialized argument once
+// and dispatches on its __spec_id:
+//
+//   tmp = <spec-arg>, (*tbl[tmp->__spec_id])(tmp, args...)
+//
+// param-funcall = "<" cast ">" "(" func-args ")"
+//
+// The specialized argument is parsed as a cast-expression so that ">" always
+// closes it; anything larger has to be parenthesized.
+static Node *param_funcall(Token **rest, Token *tok, Node *fn) {
+  Token *start = tok;
+  ParamFunc *pf = hashmap_get(&param_funcs, fn->var->name);
+
+  tok = skip(tok, "<");
+  Node *arg = cast(&tok, tok);
+  tok = skip(tok, ">");
+  tok = skip(tok, "(");
+
+  add_type(arg);
+  if (arg->ty->kind != TY_PTR || !generalization_of(arg->ty->base))
+    error_tok(start, "generalization pointer or specialization pointer expected");
+  if (!same_generalization(arg->ty->base, pf->gen))
+    error_tok(start, "pointer to the generalization of '%s' expected", pf->name);
+
+  Obj *tmp = new_lvar("", arg->ty);
+  Node *save = new_binary(ND_ASSIGN, new_var_node(tmp, start), arg, start);
+  add_type(save);
+
+  Node *slot = new_unary(ND_DEREF,
+                         new_add(new_var_node(pf->tbl, start),
+                                 spec_id_from_ptr(new_var_node(tmp, start), start),
+                                 start),
+                         start);
+  Node *call = funcall(rest, tok, slot, new_var_node(tmp, start));
+  return new_binary(ND_COMMA, save, call, start);
+}
+
 static void emit_declared_spec_syms(void) {
   for (TypeList *p = generalizations; p; p = p->next) {
     Type *gen = p->ty;
@@ -3348,6 +3703,7 @@ static Node *new_inc_dec(Node *node, Token *tok, int addend) {
 
 // postfix = "(" type-name ")" "{" initializer-list "}"
 //         = ident "(" func-args ")" postfix-tail*
+//         | ident param-funcall postfix-tail*
 //         | primary postfix-tail*
 //
 // postfix-tail = "[" expr "]"
@@ -3378,8 +3734,16 @@ static Node *postfix(Token **rest, Token *tok) {
   Node *node = primary(&tok, tok);
 
   for (;;) {
+    if (is_param_func_node(node)) {
+      if (!equal(tok, "<"))
+        error_tok(tok, "parametric function '%s' needs a specialized argument",
+                  node->var->name);
+      node = param_funcall(&tok, tok, node);
+      continue;
+    }
+
     if (equal(tok, "(")) {
-      node = funcall(&tok, tok->next, node);
+      node = funcall(&tok, tok->next, node, NULL);
       continue;
     }
 
@@ -3424,7 +3788,9 @@ static Node *postfix(Token **rest, Token *tok) {
 }
 
 // funcall = (assign ("," assign)*)? ")"
-static Node *funcall(Token **rest, Token *tok, Node *fn) {
+//
+// Parametric functions use pre_arg for the specialized argument.
+static Node *funcall(Token **rest, Token *tok, Node *fn, Node *pre_arg) {
   add_type(fn);
 
   if (fn->ty->kind != TY_FUNC &&
@@ -3437,9 +3803,21 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
   Node head = {};
   Node *cur = &head;
 
+  if (pre_arg) {
+    add_type(pre_arg);
+    if (param_ty) {
+      pre_arg = new_cast(pre_arg, param_ty);
+      param_ty = param_ty->next;
+    }
+    cur = cur->next = pre_arg;
+  }
+
+  bool first = true;
+
   while (!equal(tok, ")")) {
-    if (cur != &head)
+    if (!first)
       tok = skip(tok, ",");
+    first = false;
 
     Node *arg = assign(&tok, tok);
     add_type(arg);
@@ -3725,7 +4103,7 @@ static Node *primary(Token **rest, Token *tok) {
         return new_num(sc->enum_val, tok);
     }
 
-    if (equal(tok->next, "("))
+    if (equal(tok->next, "(") || equal(tok->next, "<"))
       error_tok(tok, "implicit declaration of a function");
     error_tok(tok, "undefined variable");
   }
@@ -3845,10 +4223,13 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
     error_tok(ty->name_pos, "function name omitted");
   char *name_str = get_ident(ty->name);
 
+  if (ty->spec_param_n > 0)
+    return param_function(tok, ty, name_str, attr);
+
   Obj *fn = find_func(name_str);
   if (fn) {
     // Redeclaration
-    if (!fn->is_function)
+    if (!fn->is_function || fn->ty->spec_param_n > 0)
       error_tok(tok, "redeclared as a different kind of symbol");
     if (fn->is_definition && equal(tok, "{"))
       error_tok(tok, "redefinition of %s", name_str);
@@ -4056,6 +4437,7 @@ Obj *parse(Token *tok) {
   globals = NULL;
   generalizations = NULL;
   spec_syms = (HashMap){};
+  param_funcs = (HashMap){};
 
   while (tok->kind != TK_EOF) {
     if (is_extension(tok)) {
