@@ -1,0 +1,17 @@
+Start
+Using Container as Figure
+Figure Container contains 10 elements.
+0: It is Rectangle: x = 3, y = 10
+1: It is Triangle: a = 3, b = 4, c = 5
+2: It is Rectangle: x = 13, y = 20
+3: Figure Container contains 3 elements.
+0: It is Rectangle: x = 13, y = 110
+1: It is Triangle: a = 13, b = 14, c = 15
+2: It is Rectangle: x = 333, y = 3210
+4: It is Rectangle: x = 113, y = 120
+5: It is Rectangle: x = 23, y = 210
+6: It is Triangle: a = 23, b = 24, c = 25
+7: It is Rectangle: x = 213, y = 220
+8: It is Triangle: a = 323, b = 324, c = 325
+9: It is Rectangle: x = 3213, y = 3220
+Stop
