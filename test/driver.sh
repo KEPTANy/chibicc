@@ -309,4 +309,246 @@ echo 'int main() {}' | $chibicc -c -o $tmp/baz.o -xc -
 cc -Xlinker -z -Xlinker muldefs -Xlinker --gc-sections -o $tmp/foo $tmp/foo.o $tmp/bar.o $tmp/baz.o
 check -Xlinker
 
+# Cross-TU specialization ID merge
+cat > $tmp/spec1.c << 'EOF'
+struct A { int x; } <a: char; b: int;>;
+int tag_a1(void) { return spec_id_of(struct A.a); }
+int tag_b(void) { return spec_id_of(struct A.b); }
+EOF
+cat > $tmp/spec2.c << 'EOF'
+struct A { int x; } <a: char;>;
+struct A + <c: long;>;
+int tag_a1(void);
+int tag_b(void);
+int tag_a2(void) { return spec_id_of(struct A.a); }
+int tag_c(void) { return spec_id_of(struct A.c); }
+int main(void) {
+  int a1 = tag_a1();
+  int a2 = tag_a2();
+  int b = tag_b();
+  int c = tag_c();
+  if (!a1 || !a2 || !b || !c)
+    return 1;
+  if (a1 != a2)
+    return 2;
+  if (a1 == b || a1 == c || b == c)
+    return 3;
+  return 0;
+}
+EOF
+$chibicc -o $tmp/specmerge $tmp/spec1.c $tmp/spec2.c
+$tmp/specmerge
+check 'spec id merge'
+
+# spec_id_of is stable, works on typedefs, and is assigned before user constructors
+cat > $tmp/spec_single.c << 'EOF'
+struct A { int x; } <a: char; b: int;>;
+typedef struct A TA;
+int seen;
+__attribute__((constructor)) void user_ctor(void) {
+    seen = spec_id_of(struct A.a);
+}
+int main(void) {
+    int a = spec_id_of(struct A.a);
+    int b = spec_id_of(struct A.b);
+    int a2 = spec_id_of(TA.a);
+    if (!a || !b || !seen)
+        return 1;
+    if (a != a2 || a != seen || a == b)
+        return 2;
+    return 0;
+}
+EOF
+$chibicc -o $tmp/specsingle $tmp/spec_single.c
+$tmp/specsingle
+check 'spec_id_of single file'
+
+# Three TUs share the same specialization
+cat > $tmp/spec3a.c << 'EOF'
+struct A { int x; } <a: char;>;
+int id_a(void) { return spec_id_of(struct A.a); }
+EOF
+cat > $tmp/spec3b.c << 'EOF'
+struct A { int x; } <a: char;>;
+int id_b(void) { return spec_id_of(struct A.a); }
+EOF
+cat > $tmp/spec3c.c << 'EOF'
+struct A { int x; } <a: char;>;
+int id_a(void);
+int id_b(void);
+int main(void) {
+    int a = id_a();
+    int b = id_b();
+    int c = spec_id_of(struct A.a);
+    if (!a || a != b || a != c)
+        return 1;
+    return 0;
+}
+EOF
+$chibicc -o $tmp/spec3 $tmp/spec3a.c $tmp/spec3b.c $tmp/spec3c.c
+$tmp/spec3
+check 'spec id three TUs'
+
+# Nested specialization ids
+cat > $tmp/specnest.c << 'EOF'
+struct A { int x; } <a: struct A; b: char;>;
+int main(void) {
+    int a = spec_id_of(struct A.a);
+    int ab = spec_id_of(struct A.a.b);
+    int b = spec_id_of(struct A.b);
+    if (!a || !ab || !b)
+        return 1;
+    if (a == ab || ab == b || a == b)
+        return 2;
+    return 0;
+}
+EOF
+$chibicc -o $tmp/specnest $tmp/specnest.c
+$tmp/specnest
+check 'spec_id_of nested'
+
+# Independent generalizations keep separate counters
+cat > $tmp/specgens.c << 'EOF'
+struct A { int x; } <a: char;>;
+struct B { int y; } <a: char;>;
+int main(void) {
+    int a = spec_id_of(struct A.a);
+    int b = spec_id_of(struct B.a);
+    if (!a || !b)
+        return 1;
+    return 0;
+}
+EOF
+$chibicc -o $tmp/specgens $tmp/specgens.c
+$tmp/specgens
+check 'spec_id_of two generalizations'
+
+# spec_id_of rejects a non-specialized type
+echo 'int main() { return spec_id_of(int); }' | $chibicc -c -o $tmp/bad.o -xc - >/dev/null 2>&1
+[ $? != 0 ]
+check 'spec_id_of rejects non-spec'
+
+echo 'struct A { int x; } <a: char;>; int main() { return spec_id_of(struct A); }' | $chibicc -c -o $tmp/bad.o -xc - >/dev/null 2>&1
+[ $? != 0 ]
+check 'spec_id_of rejects generalization'
+
+# Linked binary keeps a single constructor for a shared spec
+cat > $tmp/comdat1.c << 'EOF'
+struct A { int x; } <a: char;>;
+int id1(void) { return spec_id_of(struct A.a); }
+EOF
+cat > $tmp/comdat2.c << 'EOF'
+struct A { int x; } <a: char;>;
+int id1(void);
+int main(void) { return id1() != spec_id_of(struct A.a); }
+EOF
+$chibicc -o $tmp/speccomdat $tmp/comdat1.c $tmp/comdat2.c
+$tmp/speccomdat
+n=$(nm -g $tmp/speccomdat | grep -c '__spec_reg\.A\.a')
+[ "$n" = 1 ]
+check 'spec ctor comdat merge'
+
+# Variations of a parametric function defined in separate TUs share one table
+cat > $tmp/pf1.c << 'EOF'
+struct A { int x; } <a: int; b: char;>;
+int Value<struct A.a *v>(void) { return v->@; }
+EOF
+cat > $tmp/pf2.c << 'EOF'
+struct A { int x; } <a: int;>;
+struct A + <b: char; c: long;>;
+int Value<struct A.b *v>(void) { return v->@; }
+int Value<struct A.a *v>(void);
+int main(void) {
+  struct A.a a;
+  struct A.b b;
+  init_spec(struct A.a, &a);
+  init_spec(struct A.b, &b);
+  a.@ = 5;
+  b.@ = 6;
+  if (Value<&a>() != 5)
+    return 1;
+  if (Value<&b>() != 6)
+    return 2;
+  return 0;
+}
+EOF
+$chibicc -o $tmp/pfmerge $tmp/pf1.c $tmp/pf2.c
+$tmp/pfmerge
+check 'param func merge'
+
+# A default defined in one TU covers specializations declared in another
+cat > $tmp/pfdef1.c << 'EOF'
+struct A { int x; } <a: int; b: char;>;
+int Value<struct A *v>(void) { return -v->x; }
+EOF
+cat > $tmp/pfdef2.c << 'EOF'
+struct A { int x; } <a: int; b: char;>;
+int Value<struct A.a *v>(void) { return v->@; }
+int main(void) {
+  struct A.a a;
+  struct A.b b;
+  init_spec(struct A.a, &a);
+  init_spec(struct A.b, &b);
+  a.@ = 4;
+  b.x = 9;
+  if (Value<&a>() != 4)
+    return 1;
+  if (Value<&b>() != -9)
+    return 2;
+  return 0;
+}
+EOF
+$chibicc -o $tmp/pfdefault $tmp/pfdef1.c $tmp/pfdef2.c
+$tmp/pfdefault
+check 'param func default across TUs'
+
+# Identical variations in two TUs collapse into a single definition
+cat > $tmp/pfcd1.c << 'EOF'
+struct A { int x; } <a: int;>;
+int Value<struct A.a *v>(void) { return v->@; }
+int Value<struct A *v>(void) { return -v->x; }
+int other(void) { return 1; }
+EOF
+cat > $tmp/pfcd2.c << 'EOF'
+struct A { int x; } <a: int;>;
+int Value<struct A.a *v>(void) { return v->@; }
+int Value<struct A *v>(void) { return -v->x; }
+int other(void);
+int main(void) {
+  struct A.a a;
+  init_spec(struct A.a, &a);
+  a.@ = 3;
+  return Value<&a>() != 3 || other() != 1;
+}
+EOF
+$chibicc -o $tmp/pfcomdat $tmp/pfcd1.c $tmp/pfcd2.c
+$tmp/pfcomdat
+check 'param func comdat merge'
+for sym in '__param_func\.Value\.A\.a' '__param_func_reg\.Value' \
+           '__param_func_setdef\.Value' '__param_func_tbl_init\.Value'; do
+  n=$(nm $tmp/pfcomdat | grep -c "$sym")
+  [ "$n" = 1 ] || { echo "testing param func single definition ... failed ($sym x$n)"; exit 1; }
+done
+check 'param func single definition'
+
+echo 'struct A { int x; } <a: int;>; struct B { int y; } <p: int;>; void f<struct A.a *u, struct B.p *v>(void) {}' | $chibicc -c -o $tmp/bad.o -xc - >/dev/null 2>&1
+[ $? != 0 ]
+check 'param func rejects two specialized params'
+
+echo 'struct A { int x; } <a: int;>; void f<struct A.a *v>(void) {} int main() { f(); }' | $chibicc -c -o $tmp/bad.o -xc - >/dev/null 2>&1
+[ $? != 0 ]
+check 'param func rejects call without specialized argument'
+
+echo 'struct A { int x; } <a: int;>; struct B { int y; } <p: int;>; void f<struct A.a *v>(void) {} int main() { struct B.p b; f<&b>(); }' | $chibicc -c -o $tmp/bad.o -xc - >/dev/null 2>&1
+[ $? != 0 ]
+check 'param func rejects other generalization'
+
+echo 'struct A { int x; } <a: int;>; void f<struct A *v>(void) {} void f<struct A *v>(void) {}' | $chibicc -c -o $tmp/bad.o -xc - >/dev/null 2>&1
+[ $? != 0 ]
+check 'param func rejects two defaults'
+
+echo 'struct A { int x; } <a: int; b: int;>; void f<struct A.a *v>(int n) {} void f<struct A.b *v>(long n) {}' | $chibicc -c -o $tmp/bad.o -xc - >/dev/null 2>&1
+[ $? != 0 ]
+check 'param func rejects conflicting types'
+
 echo OK
